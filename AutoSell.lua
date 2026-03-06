@@ -1,6 +1,6 @@
 -- ================================================================
 -- TITAN FISHING  |  Auto Sell  |  Mobile
--- Chuc nang: Tu dong cau + dem nguoc + tu dong ban ca
+-- Fix: Cast/Sell tu phuc hoi khi gap loi click
 -- ================================================================
 local Players = game:GetService("Players")
 local UIS     = game:GetService("UserInputService")
@@ -27,19 +27,23 @@ local savedSellPos  = nil
 local savedClosePos = nil
 local savedCastPos  = nil
 
--- INSET: AbsolutePosition = viewport coords, VIM can screen coords
--- â†’ cong INSET.Y vao Y khi gui click
 local INSET = GS:GetGuiInset()
 
 -- ================================================================
--- CLICK
+-- CLICK  (viewport coords â†’ tu cong INSET â†’ screen coords)
+-- tra ve true neu thanh cong, false neu loi
 -- ================================================================
 local function doClick(vx, vy)
     local sx = vx
     local sy = vy + INSET.Y
-    VIM:SendMouseButtonEvent(sx, sy, 0, true,  game, 0)
+    local ok1 = pcall(function()
+        VIM:SendMouseButtonEvent(sx, sy, 0, true, game, 0)
+    end)
     task.wait(0.06)
-    VIM:SendMouseButtonEvent(sx, sy, 0, false, game, 0)
+    local ok2 = pcall(function()
+        VIM:SendMouseButtonEvent(sx, sy, 0, false, game, 0)
+    end)
+    return ok1 and ok2
 end
 
 local function uiClick(vx, vy)
@@ -47,27 +51,76 @@ local function uiClick(vx, vy)
     local sy = vy + INSET.Y
     pcall(function() VIM:SendMouseMoveEvent(sx, sy, game) end)
     task.wait(0.04)
-    pcall(function() VIM:SendMouseButtonEvent(sx, sy, 0, true,  game, 0) end)
+    local ok1 = pcall(function()
+        VIM:SendMouseButtonEvent(sx, sy, 0, true,  game, 0)
+    end)
     task.wait(0.1)
-    pcall(function() VIM:SendMouseButtonEvent(sx, sy, 0, false, game, 0) end)
+    local ok2 = pcall(function()
+        VIM:SendMouseButtonEvent(sx, sy, 0, false, game, 0)
+    end)
     task.wait(0.05)
+    return ok1 and ok2
 end
 
 -- ================================================================
--- CAST LOOP
+-- CAST LOOP voi WATCHDOG
+--
+-- Cach hoat dong:
+--   castActive = true/false  â†’ bat/tat vong lap
+--   castToken               â†’ moi lan restart tang len 1,
+--                              loop cu thay token khac se tu thoat
+--
+-- Watchdog chay rieng: neu castActive=true nhung loop da chet
+-- (lastCastPing khong duoc cap nhat trong 3 giay) â†’ tu restart.
 -- ================================================================
-local castActive = false
-local castToken  = 0
+local castActive  = false
+local castToken   = 0
+local lastCastPing = 0   -- thoi diem lan cuoi loop con song
 
 local function startCastLoop()
     castToken = castToken + 1
     local tk  = castToken
+    lastCastPing = tick()
+
     task.spawn(function()
+        local failStreak = 0   -- dem so lan click loi lien tiep
+
         while castActive and castToken == tk do
             if savedCastPos and not isSelling then
-                pcall(doClick, savedCastPos.X, savedCastPos.Y)
+                local ok = doClick(savedCastPos.X, savedCastPos.Y)
+
+                if ok then
+                    failStreak   = 0
+                    lastCastPing = tick()   -- con song, cap nhat ping
+                else
+                    failStreak = failStreak + 1
+                    -- Neu loi 3 lan lien tiep â†’ cho 1 giay roi thu lai
+                    if failStreak >= 3 then
+                        task.wait(1)
+                        failStreak = 0
+                    end
+                end
+            else
+                lastCastPing = tick()   -- khong can click nhung loop van song
             end
+
             task.wait(0.45)
+        end
+    end)
+end
+
+-- Watchdog: kiem tra loop con song khong, neu chet thi restart
+local function startCastWatchdog()
+    task.spawn(function()
+        while true do
+            task.wait(3)
+            if castActive then
+                local age = tick() - lastCastPing
+                if age > 3.5 then
+                    -- Loop da chet â†’ restart
+                    startCastLoop()
+                end
+            end
         end
     end)
 end
@@ -75,6 +128,20 @@ end
 local function stopCast()
     castActive = false
     castToken  = castToken + 1
+end
+
+-- ================================================================
+-- SELL voi RETRY
+-- Thu uiClick toi da maxTry lan, neu van loi tra ve false
+-- ================================================================
+local function reliableUiClick(vx, vy, maxTry)
+    maxTry = maxTry or 3
+    for i = 1, maxTry do
+        local ok = uiClick(vx, vy)
+        if ok then return true end
+        task.wait(0.3 * i)   -- back-off tang dan
+    end
+    return false
 end
 
 -- ================================================================
@@ -116,7 +183,7 @@ local function stopWalk()
 end
 
 -- ================================================================
--- INTERACT + SELL
+-- INTERACT
 -- ================================================================
 local function doInteract()
     statusText = "Mo cua hang..."
@@ -141,19 +208,49 @@ local function doInteract()
     task.wait(0.8)
 end
 
+-- ================================================================
+-- SELL voi RETRY
+-- Neu click SellAll that bai â†’ thu lai toi da 3 lan truoc khi bo qua
+-- ================================================================
 local function doSellAll()
     if not savedSellPos or not savedClosePos then
         statusText = "Chua luu SellAll/X!"
         task.wait(2)
-        return
+        return false
     end
+
+    -- Thu click SellAll (toi da 3 lan)
     statusText = "Cho popup..."
     task.wait(0.8)
-    uiClick(savedSellPos.X,  savedSellPos.Y)
+    local sellOk = false
+    for attempt = 1, 3 do
+        sellOk = reliableUiClick(savedSellPos.X, savedSellPos.Y, 2)
+        if sellOk then break end
+        statusText = "Thu lai SellAll (" .. attempt .. ")..."
+        task.wait(0.5 * attempt)
+    end
+
+    if not sellOk then
+        statusText = "SellAll that bai, bo qua!"
+        task.wait(1)
+        return false
+    end
+
+    -- Cho popup hien
     task.wait(1.2)
-    uiClick(savedClosePos.X, savedClosePos.Y)
+
+    -- Thu click X dong (toi da 3 lan)
+    local closeOk = false
+    for attempt = 1, 3 do
+        closeOk = reliableUiClick(savedClosePos.X, savedClosePos.Y, 2)
+        if closeOk then break end
+        statusText = "Thu lai X dong (" .. attempt .. ")..."
+        task.wait(0.4 * attempt)
+    end
+
     task.wait(0.5)
-    statusText = "Da ban xong!"
+    statusText = closeOk and "Da ban xong!" or "Dong popup that bai!"
+    return sellOk
 end
 
 -- ================================================================
@@ -178,6 +275,7 @@ local function mainLoop()
         stopCast()
         task.wait(0.15)
 
+        -- Di ve vi tri cau neu can
         local char = LP.Character
         local hrp  = char and char:FindFirstChild("HumanoidRootPart")
         if hrp and savedFishPos and (hrp.Position - savedFishPos).Magnitude > 5 then
@@ -187,15 +285,16 @@ local function mainLoop()
             task.wait(0.5)
         end
 
+        -- Bat cast
         castActive = true
         startCastLoop()
 
+        -- Dem nguoc
         countdownSec = fishMinutes * 60
         while countdownSec > 0 and isRunning do
             local m = math.floor(countdownSec / 60)
             local s = countdownSec % 60
-            statusText = m .. ":" .. string.format("%02d", s)
-                      .. "  Ban:" .. sellCount
+            statusText = m .. ":" .. string.format("%02d", s) .. "  Ban:" .. sellCount
             task.wait(1)
             countdownSec = countdownSec - 1
         end
@@ -229,6 +328,11 @@ local function mainLoop()
 end
 
 -- ================================================================
+-- KHOI DONG WATCHDOG (chay 1 lan duy nhat khi script load)
+-- ================================================================
+startCastWatchdog()
+
+-- ================================================================
 -- GUI
 -- ================================================================
 local old = LP.PlayerGui:FindFirstChild("TFHub")
@@ -241,18 +345,14 @@ sg.IgnoreGuiInset = true
 sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 sg.Parent         = LP.PlayerGui
 
--- ================================================================
--- getCenter â†’ viewport coords (doClick/uiClick tu cong INSET)
--- ================================================================
 local function getCenter(m)
     local ap = m.AbsolutePosition
     local as = m.AbsoluteSize
-    return ap.X + as.X * 0.5,
-           ap.Y + as.Y * 0.5
+    return ap.X + as.X * 0.5, ap.Y + as.Y * 0.5
 end
 
 -- ================================================================
--- MARKER (vong tron keo tha de dat toa do click)
+-- MARKER
 -- ================================================================
 local function makeMarker(col, tag)
     local S = 70
@@ -306,7 +406,6 @@ local function makeMarker(col, tag)
             m.BackgroundTransparency = 0.1 + math.abs(math.sin(tick() * 2.5)) * 0.35
         end
     end)
-
     return m
 end
 
@@ -318,7 +417,7 @@ local markerCast  = makeMarker(Color3.fromRGB(255, 200, 0),   "FISHING")
 -- HUB
 -- ================================================================
 local HW = 280
-local HH = 420
+local HH = 460
 
 local hub = Instance.new("Frame", sg)
 hub.Name                   = "Hub"
@@ -333,8 +432,7 @@ hub.ClipsDescendants       = true
 hub.ZIndex                 = 10
 Instance.new("UICorner", hub).CornerRadius = UDim.new(0, 12)
 local hubStroke = Instance.new("UIStroke", hub)
-hubStroke.Color     = Color3.fromRGB(50, 50, 90)
-hubStroke.Thickness = 1.5
+hubStroke.Color = Color3.fromRGB(50, 50, 90); hubStroke.Thickness = 1.5
 
 -- Header
 local HDR    = 40
@@ -350,7 +448,6 @@ hg.Color = ColorSequence.new({
 })
 hg.Rotation = 90
 
--- Logo
 local logoF = Instance.new("Frame", header)
 logoF.Size             = UDim2.new(0, 28, 0, 28)
 logoF.Position         = UDim2.new(0, 6, 0.5, -14)
@@ -358,16 +455,12 @@ logoF.BackgroundColor3 = Color3.fromRGB(255, 140, 0)
 logoF.BorderSizePixel  = 0; logoF.ZIndex = 12
 Instance.new("UICorner", logoF).CornerRadius = UDim.new(1, 0)
 local logoL = Instance.new("TextLabel", logoF)
-logoL.Size               = UDim2.new(1, 0, 1, 0)
-logoL.BackgroundTransparency = 1
-logoL.Text               = "TF"
-logoL.Font               = Enum.Font.GothamBlack
-logoL.TextSize           = 10
-logoL.TextColor3         = Color3.new(1, 1, 1)
-logoL.ZIndex             = 13
+logoL.Size = UDim2.new(1,0,1,0); logoL.BackgroundTransparency = 1
+logoL.Text = "TF"; logoL.Font = Enum.Font.GothamBlack
+logoL.TextSize = 10; logoL.TextColor3 = Color3.new(1,1,1); logoL.ZIndex = 13
 
 local titleL = Instance.new("TextLabel", header)
-titleL.Size               = UDim2.new(0, 140, 1, 0)
+titleL.Size               = UDim2.new(0, 150, 1, 0)
 titleL.Position           = UDim2.new(0, 40, 0, 0)
 titleL.BackgroundTransparency = 1
 titleL.Text               = "Titan Fishing  Auto Sell"
@@ -377,7 +470,6 @@ titleL.TextColor3         = Color3.new(1, 1, 1)
 titleL.TextXAlignment     = Enum.TextXAlignment.Left
 titleL.ZIndex             = 12
 
--- Status dot
 local sDot = Instance.new("Frame", header)
 sDot.Size             = UDim2.new(0, 8, 0, 8)
 sDot.Position         = UDim2.new(1, -52, 0.5, -4)
@@ -385,26 +477,22 @@ sDot.BackgroundColor3 = Color3.fromRGB(255, 80, 80)
 sDot.BorderSizePixel  = 0; sDot.ZIndex = 12
 Instance.new("UICorner", sDot).CornerRadius = UDim.new(1, 0)
 
--- X button
 local xBtn = Instance.new("TextButton", header)
 xBtn.Size             = UDim2.new(0, 26, 0, 26)
 xBtn.Position         = UDim2.new(1, -32, 0.5, -13)
 xBtn.BackgroundColor3 = Color3.fromRGB(200, 40, 40)
-xBtn.BorderSizePixel  = 0
-xBtn.Text             = "X"
-xBtn.TextColor3       = Color3.new(1, 1, 1)
+xBtn.BorderSizePixel  = 0; xBtn.Text = "X"
+xBtn.TextColor3       = Color3.new(1,1,1)
 xBtn.Font             = Enum.Font.GothamBlack
 xBtn.TextSize         = 12; xBtn.ZIndex = 13
 Instance.new("UICorner", xBtn).CornerRadius = UDim.new(0, 7)
 
--- Open button
 local openBtn = Instance.new("TextButton", sg)
 openBtn.Size             = UDim2.new(0, 62, 0, 28)
 openBtn.Position         = UDim2.new(0, 8, 0, 50)
 openBtn.BackgroundColor3 = Color3.fromRGB(255, 130, 0)
-openBtn.BorderSizePixel  = 0
-openBtn.Text             = "OPEN"
-openBtn.TextColor3       = Color3.new(1, 1, 1)
+openBtn.BorderSizePixel  = 0; openBtn.Text = "OPEN"
+openBtn.TextColor3       = Color3.new(1,1,1)
 openBtn.Font             = Enum.Font.GothamBlack
 openBtn.TextSize         = 12; openBtn.ZIndex = 30
 openBtn.Visible          = false; openBtn.Active = true
@@ -412,271 +500,222 @@ Instance.new("UICorner", openBtn).CornerRadius = UDim.new(0, 8)
 Instance.new("UIStroke",  openBtn).Color       = Color3.fromRGB(255, 200, 80)
 
 local hubOpen = true
-
 local function showHub()
     hubOpen = true; hub.Visible = true; openBtn.Visible = false
-    hub.Size     = UDim2.new(0, 0, 0, 0)
-    hub.Position = UDim2.new(0, 8 + HW/2, 0, 50 + HH/2)
-    TS:Create(hub, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-        Size = UDim2.new(0, HW, 0, HH), Position = UDim2.new(0, 8, 0, 50),
-    }):Play()
+    hub.Size = UDim2.new(0,0,0,0)
+    hub.Position = UDim2.new(0, 8+HW/2, 0, 50+HH/2)
+    TS:Create(hub, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+        {Size=UDim2.new(0,HW,0,HH), Position=UDim2.new(0,8,0,50)}):Play()
 end
 local function hideHub()
     hubOpen = false
-    TS:Create(hub, TweenInfo.new(0.15, Enum.EasingStyle.Quart, Enum.EasingDirection.In), {
-        Size = UDim2.new(0, 0, 0, 0), Position = UDim2.new(0, 8 + HW/2, 0, 50 + HH/2),
-    }):Play()
-    task.delay(0.18, function() hub.Visible = false; openBtn.Visible = true end)
+    TS:Create(hub, TweenInfo.new(0.15, Enum.EasingStyle.Quart, Enum.EasingDirection.In),
+        {Size=UDim2.new(0,0,0,0), Position=UDim2.new(0,8+HW/2,0,50+HH/2)}):Play()
+    task.delay(0.18, function() hub.Visible=false; openBtn.Visible=true end)
 end
 xBtn.MouseButton1Click:Connect(hideHub)
 openBtn.MouseButton1Click:Connect(showHub)
 
 -- ================================================================
--- CONTENT  (scroll)
+-- BODY SCROLL
 -- ================================================================
 local body = Instance.new("ScrollingFrame", hub)
-body.Size                 = UDim2.new(1, 0, 1, -HDR)
-body.Position             = UDim2.new(0, 0, 0, HDR)
+body.Size                   = UDim2.new(1, 0, 1, -HDR)
+body.Position               = UDim2.new(0, 0, 0, HDR)
 body.BackgroundTransparency = 1
-body.BorderSizePixel      = 0
-body.ScrollBarThickness   = 3
-body.ScrollBarImageColor3 = Color3.fromRGB(255, 140, 0)
-body.ZIndex               = 11
+body.BorderSizePixel        = 0
+body.ScrollBarThickness     = 3
+body.ScrollBarImageColor3   = Color3.fromRGB(255, 140, 0)
+body.ZIndex                 = 11
 
 local PAD = 8
 local CW  = HW - PAD * 2
 local bY  = PAD
 
--- helpers
 local function mkSec(Y, txt)
     local l = Instance.new("TextLabel", body)
-    l.Size               = UDim2.new(0, CW, 0, 16)
-    l.Position           = UDim2.new(0, PAD, 0, Y)
-    l.BackgroundTransparency = 1
-    l.Text               = txt
-    l.TextColor3         = Color3.fromRGB(255, 140, 0)
-    l.Font               = Enum.Font.GothamBlack
-    l.TextSize           = 10
-    l.TextXAlignment     = Enum.TextXAlignment.Left
-    l.ZIndex             = 13
+    l.Size = UDim2.new(0,CW,0,16); l.Position = UDim2.new(0,PAD,0,Y)
+    l.BackgroundTransparency = 1; l.Text = txt
+    l.TextColor3 = Color3.fromRGB(255,140,0)
+    l.Font = Enum.Font.GothamBlack; l.TextSize = 10
+    l.TextXAlignment = Enum.TextXAlignment.Left; l.ZIndex = 13
 end
-
 local function mkDiv(Y)
     local d = Instance.new("Frame", body)
-    d.Size             = UDim2.new(0, CW, 0, 1)
-    d.Position         = UDim2.new(0, PAD, 0, Y)
-    d.BackgroundColor3 = Color3.fromRGB(35, 35, 55)
-    d.BorderSizePixel  = 0; d.ZIndex = 12
+    d.Size = UDim2.new(0,CW,0,1); d.Position = UDim2.new(0,PAD,0,Y)
+    d.BackgroundColor3 = Color3.fromRGB(35,35,55); d.BorderSizePixel=0; d.ZIndex=12
 end
-
 local function mkRow(Y, h)
     local f = Instance.new("Frame", body)
-    f.Size             = UDim2.new(0, CW, 0, h)
-    f.Position         = UDim2.new(0, PAD, 0, Y)
-    f.BackgroundColor3 = Color3.fromRGB(16, 16, 30)
-    f.BorderSizePixel  = 0; f.ZIndex = 12
-    Instance.new("UICorner", f).CornerRadius = UDim.new(0, 8)
-    Instance.new("UIStroke",  f).Color       = Color3.fromRGB(38, 38, 60)
+    f.Size = UDim2.new(0,CW,0,h); f.Position = UDim2.new(0,PAD,0,Y)
+    f.BackgroundColor3 = Color3.fromRGB(16,16,30); f.BorderSizePixel=0; f.ZIndex=12
+    Instance.new("UICorner",f).CornerRadius = UDim.new(0,8)
+    Instance.new("UIStroke",f).Color = Color3.fromRGB(38,38,60)
     return f
 end
-
 local function mkBtn(Y, h, bg, txt, fs)
     local b = Instance.new("TextButton", body)
-    b.Size             = UDim2.new(0, CW, 0, h)
-    b.Position         = UDim2.new(0, PAD, 0, Y)
-    b.BackgroundColor3 = bg
-    b.BorderSizePixel  = 0
-    b.Text             = txt
-    b.TextColor3       = Color3.new(1, 1, 1)
-    b.Font             = Enum.Font.GothamBold
-    b.TextSize         = fs or 12
-    b.TextWrapped      = true; b.ZIndex = 13
-    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 8)
+    b.Size = UDim2.new(0,CW,0,h); b.Position = UDim2.new(0,PAD,0,Y)
+    b.BackgroundColor3=bg; b.BorderSizePixel=0
+    b.Text=txt; b.TextColor3=Color3.new(1,1,1)
+    b.Font=Enum.Font.GothamBold; b.TextSize=fs or 12
+    b.TextWrapped=true; b.ZIndex=13
+    Instance.new("UICorner",b).CornerRadius=UDim.new(0,8)
     return b
 end
-
 local function mkInfoRow(Y, txt, col)
     local f = mkRow(Y, 26)
     local l = Instance.new("TextLabel", f)
-    l.Size               = UDim2.new(1, -8, 1, 0)
-    l.Position           = UDim2.new(0, 6, 0, 0)
-    l.BackgroundTransparency = 1
-    l.Text               = txt
-    l.TextColor3         = col or Color3.fromRGB(160, 160, 200)
-    l.Font               = Enum.Font.GothamBold
-    l.TextSize           = 10
-    l.TextXAlignment     = Enum.TextXAlignment.Left
-    l.TextTruncate       = Enum.TextTruncate.AtEnd
-    l.ZIndex             = 13
+    l.Size=UDim2.new(1,-8,1,0); l.Position=UDim2.new(0,6,0,0)
+    l.BackgroundTransparency=1; l.Text=txt
+    l.TextColor3=col or Color3.fromRGB(160,160,200)
+    l.Font=Enum.Font.GothamBold; l.TextSize=10
+    l.TextXAlignment=Enum.TextXAlignment.Left
+    l.TextTruncate=Enum.TextTruncate.AtEnd; l.ZIndex=13
     return l
 end
-
 local function mkStepper(Y, lbl, initVal, col)
     local f  = mkRow(Y, 30)
     local ll = Instance.new("TextLabel", f)
-    ll.Size               = UDim2.new(0, 100, 1, 0)
-    ll.Position           = UDim2.new(0, 6, 0, 0)
-    ll.BackgroundTransparency = 1
-    ll.Text               = lbl
-    ll.TextColor3         = Color3.fromRGB(180, 180, 220)
-    ll.Font               = Enum.Font.GothamBold
-    ll.TextSize           = 10
-    ll.TextXAlignment     = Enum.TextXAlignment.Left
-    ll.ZIndex             = 13
-
+    ll.Size=UDim2.new(0,100,1,0); ll.Position=UDim2.new(0,6,0,0)
+    ll.BackgroundTransparency=1; ll.Text=lbl
+    ll.TextColor3=Color3.fromRGB(180,180,220)
+    ll.Font=Enum.Font.GothamBold; ll.TextSize=10
+    ll.TextXAlignment=Enum.TextXAlignment.Left; ll.ZIndex=13
     local vl = Instance.new("TextLabel", f)
-    vl.Size               = UDim2.new(0, 36, 1, 0)
-    vl.Position           = UDim2.new(0, 108, 0, 0)
-    vl.BackgroundTransparency = 1
-    vl.Text               = initVal
-    vl.TextColor3         = col or Color3.fromRGB(255, 220, 80)
-    vl.Font               = Enum.Font.GothamBold
-    vl.TextSize           = 11; vl.ZIndex = 13
-
+    vl.Size=UDim2.new(0,36,1,0); vl.Position=UDim2.new(0,108,0,0)
+    vl.BackgroundTransparency=1; vl.Text=initVal
+    vl.TextColor3=col or Color3.fromRGB(255,220,80)
+    vl.Font=Enum.Font.GothamBold; vl.TextSize=11; vl.ZIndex=13
     local bm = Instance.new("TextButton", f)
-    bm.Size             = UDim2.new(0, 26, 0, 22)
-    bm.Position         = UDim2.new(1, -56, 0.5, -11)
-    bm.BackgroundColor3 = Color3.fromRGB(160, 30, 30)
-    bm.BorderSizePixel  = 0
-    bm.Text             = "-"; bm.TextColor3 = Color3.new(1,1,1)
-    bm.Font             = Enum.Font.GothamBold; bm.TextSize = 15; bm.ZIndex = 13
-    Instance.new("UICorner", bm).CornerRadius = UDim.new(0, 5)
-
+    bm.Size=UDim2.new(0,26,0,22); bm.Position=UDim2.new(1,-56,0.5,-11)
+    bm.BackgroundColor3=Color3.fromRGB(160,30,30); bm.BorderSizePixel=0
+    bm.Text="-"; bm.TextColor3=Color3.new(1,1,1)
+    bm.Font=Enum.Font.GothamBold; bm.TextSize=15; bm.ZIndex=13
+    Instance.new("UICorner",bm).CornerRadius=UDim.new(0,5)
     local bp = Instance.new("TextButton", f)
-    bp.Size             = UDim2.new(0, 26, 0, 22)
-    bp.Position         = UDim2.new(1, -28, 0.5, -11)
-    bp.BackgroundColor3 = Color3.fromRGB(25, 140, 50)
-    bp.BorderSizePixel  = 0
-    bp.Text             = "+"; bp.TextColor3 = Color3.new(1,1,1)
-    bp.Font             = Enum.Font.GothamBold; bp.TextSize = 15; bp.ZIndex = 13
-    Instance.new("UICorner", bp).CornerRadius = UDim.new(0, 5)
-
+    bp.Size=UDim2.new(0,26,0,22); bp.Position=UDim2.new(1,-28,0.5,-11)
+    bp.BackgroundColor3=Color3.fromRGB(25,140,50); bp.BorderSizePixel=0
+    bp.Text="+"; bp.TextColor3=Color3.new(1,1,1)
+    bp.Font=Enum.Font.GothamBold; bp.TextSize=15; bp.ZIndex=13
+    Instance.new("UICorner",bp).CornerRadius=UDim.new(0,5)
     return vl, bm, bp
 end
 
 -- ----------------------------------------------------------------
--- SECTION: DIEU KHIEN
+-- DIEU KHIEN
 -- ----------------------------------------------------------------
 mkSec(bY, "DIEU KHIEN"); bY = bY + 20
 
--- Status display
+-- Status row
 local statusRow = mkRow(bY, 32)
 local statusDot = Instance.new("Frame", statusRow)
-statusDot.Size             = UDim2.new(0, 8, 0, 8)
-statusDot.Position         = UDim2.new(0, 8, 0.5, -4)
-statusDot.BackgroundColor3 = Color3.fromRGB(255, 80, 80)
-statusDot.BorderSizePixel  = 0; statusDot.ZIndex = 13
-Instance.new("UICorner", statusDot).CornerRadius = UDim.new(1, 0)
+statusDot.Size=UDim2.new(0,8,0,8); statusDot.Position=UDim2.new(0,8,0.5,-4)
+statusDot.BackgroundColor3=Color3.fromRGB(255,80,80); statusDot.BorderSizePixel=0; statusDot.ZIndex=13
+Instance.new("UICorner",statusDot).CornerRadius=UDim.new(1,0)
 local statusLbl = Instance.new("TextLabel", statusRow)
-statusLbl.Size               = UDim2.new(1, -20, 1, 0)
-statusLbl.Position           = UDim2.new(0, 20, 0, 0)
-statusLbl.BackgroundTransparency = 1
-statusLbl.Text               = "Chua bat"
-statusLbl.TextColor3         = Color3.fromRGB(255, 100, 100)
-statusLbl.Font               = Enum.Font.GothamBold
-statusLbl.TextSize           = 10
-statusLbl.TextXAlignment     = Enum.TextXAlignment.Left
-statusLbl.TextTruncate       = Enum.TextTruncate.AtEnd
-statusLbl.ZIndex             = 13
+statusLbl.Size=UDim2.new(1,-20,1,0); statusLbl.Position=UDim2.new(0,20,0,0)
+statusLbl.BackgroundTransparency=1; statusLbl.Text="Chua bat"
+statusLbl.TextColor3=Color3.fromRGB(255,100,100)
+statusLbl.Font=Enum.Font.GothamBold; statusLbl.TextSize=10
+statusLbl.TextXAlignment=Enum.TextXAlignment.Left
+statusLbl.TextTruncate=Enum.TextTruncate.AtEnd; statusLbl.ZIndex=13
 bY = bY + 38
 
--- Timer display
+-- Timer row  (hien them trang thai watchdog)
 local timerRow = mkRow(bY, 32)
 local timerLbl = Instance.new("TextLabel", timerRow)
-timerLbl.Size               = UDim2.new(1, -8, 1, 0)
-timerLbl.Position           = UDim2.new(0, 8, 0, 0)
-timerLbl.BackgroundTransparency = 1
-timerLbl.Text               = "0:00  Ban: 0"
-timerLbl.TextColor3         = Color3.fromRGB(255, 220, 80)
-timerLbl.Font               = Enum.Font.GothamBold
-timerLbl.TextSize           = 13
-timerLbl.TextXAlignment     = Enum.TextXAlignment.Center
-timerLbl.ZIndex             = 13
+timerLbl.Size=UDim2.new(1,-8,1,0); timerLbl.Position=UDim2.new(0,8,0,0)
+timerLbl.BackgroundTransparency=1; timerLbl.Text="0:00  Ban: 0"
+timerLbl.TextColor3=Color3.fromRGB(255,220,80)
+timerLbl.Font=Enum.Font.GothamBold; timerLbl.TextSize=13
+timerLbl.TextXAlignment=Enum.TextXAlignment.Center; timerLbl.ZIndex=13
 bY = bY + 38
 
--- START / STOP
-local toggleBtn = mkBtn(bY, 44, Color3.fromRGB(30, 180, 65), "START AUTO", 15)
+-- Watchdog badge (hien khi watchdog da restart loop it nhat 1 lan)
+local wdRow = mkRow(bY, 24)
+local wdLbl = Instance.new("TextLabel", wdRow)
+wdLbl.Size=UDim2.new(1,-8,1,0); wdLbl.Position=UDim2.new(0,8,0,0)
+wdLbl.BackgroundTransparency=1; wdLbl.Text="Watchdog: san sang"
+wdLbl.TextColor3=Color3.fromRGB(100,200,255)
+wdLbl.Font=Enum.Font.GothamBold; wdLbl.TextSize=10
+wdLbl.TextXAlignment=Enum.TextXAlignment.Left; wdLbl.ZIndex=13
+bY = bY + 30
+
+-- START/STOP
+local toggleBtn = mkBtn(bY, 44, Color3.fromRGB(30,180,65), "START AUTO", 15)
 local tGrad     = Instance.new("UIGradient", toggleBtn); tGrad.Rotation = 90
 tGrad.Color = ColorSequence.new({
-    ColorSequenceKeypoint.new(0, Color3.fromRGB(50, 220, 85)),
-    ColorSequenceKeypoint.new(1, Color3.fromRGB(18, 145, 48)),
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(50,220,85)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(18,145,48)),
 })
 bY = bY + 50
 
 -- Ban ngay
-local sellNowBtn = mkBtn(bY, 30, Color3.fromRGB(200, 100, 0), "BAN NGAY", 11)
+local sellNowBtn = mkBtn(bY, 30, Color3.fromRGB(200,100,0), "BAN NGAY", 11)
 bY = bY + 36
 
--- Thoi gian cau
-local timLbl, timMin, timPlus = mkStepper(bY, "Cau (phut):", fishMinutes .. "p", Color3.fromRGB(255, 220, 80))
+-- Thoi gian
+local timLbl, timMin, timPlus = mkStepper(bY, "Cau (phut):", fishMinutes.."p", Color3.fromRGB(255,220,80))
 bY = bY + 36
-
 timMin.MouseButton1Click:Connect(function()
-    fishMinutes = math.max(1, fishMinutes - 1); timLbl.Text = fishMinutes .. "p"
+    fishMinutes = math.max(1, fishMinutes-1); timLbl.Text = fishMinutes.."p"
 end)
 timPlus.MouseButton1Click:Connect(function()
-    fishMinutes = fishMinutes + 1; timLbl.Text = fishMinutes .. "p"
+    fishMinutes = fishMinutes+1; timLbl.Text = fishMinutes.."p"
 end)
 
 mkDiv(bY); bY = bY + 10
 
 -- ----------------------------------------------------------------
--- SECTION: VI TRI TRONG GAME
+-- VI TRI GAME
 -- ----------------------------------------------------------------
 mkSec(bY, "VI TRI TRONG GAME"); bY = bY + 20
-
-local p1Lbl = mkInfoRow(bY, "Cau: Chua luu",  Color3.fromRGB(120, 180, 255)); bY = bY + 30
-local saveFishBtn = mkBtn(bY, 26, Color3.fromRGB(25, 100, 210), "SAVE vi tri cau", 11); bY = bY + 32
-local p2Lbl = mkInfoRow(bY, "NPC: Chua luu",  Color3.fromRGB(255, 180, 80));  bY = bY + 30
-local saveNPCBtn  = mkBtn(bY, 26, Color3.fromRGB(110, 35, 180), "SAVE vi tri NPC", 11); bY = bY + 32
+local p1Lbl   = mkInfoRow(bY, "Cau: Chua luu", Color3.fromRGB(120,180,255)); bY = bY + 30
+local saveFishBtn = mkBtn(bY, 26, Color3.fromRGB(25,100,210), "SAVE vi tri cau", 11); bY = bY + 32
+local p2Lbl   = mkInfoRow(bY, "NPC: Chua luu", Color3.fromRGB(255,180,80));  bY = bY + 30
+local saveNPCBtn  = mkBtn(bY, 26, Color3.fromRGB(110,35,180),  "SAVE vi tri NPC", 11); bY = bY + 32
 
 mkDiv(bY); bY = bY + 10
 
 -- ----------------------------------------------------------------
--- SECTION: NUT TREN MAN HINH (marker)
+-- NUT TREN MAN HINH
 -- ----------------------------------------------------------------
 mkSec(bY, "NUT TREN MAN HINH"); bY = bY + 20
-
-local p3Lbl    = mkInfoRow(bY, "SellAll: Chua luu", Color3.fromRGB(80, 255, 180)); bY = bY + 30
-local showSellBtn  = mkBtn(bY, 26, Color3.fromRGB(18, 140, 72),  "HIEN vong SellAll",  11); bY = bY + 32
-local p4Lbl    = mkInfoRow(bY, "X dong: Chua luu",  Color3.fromRGB(255, 130, 180)); bY = bY + 30
-local showCloseBtn = mkBtn(bY, 26, Color3.fromRGB(175, 35, 55),  "HIEN vong X dong",   11); bY = bY + 32
-local p5Lbl    = mkInfoRow(bY, "Fishing: Chua luu", Color3.fromRGB(255, 230, 80));  bY = bY + 30
-local showCastBtn  = mkBtn(bY, 26, Color3.fromRGB(155, 115, 0),  "HIEN vong Fishing",  11); bY = bY + 32
+local p3Lbl    = mkInfoRow(bY, "SellAll: Chua luu", Color3.fromRGB(80,255,180));  bY = bY + 30
+local showSellBtn  = mkBtn(bY, 26, Color3.fromRGB(18,140,72),  "HIEN vong SellAll",  11); bY = bY + 32
+local p4Lbl    = mkInfoRow(bY, "X dong: Chua luu",  Color3.fromRGB(255,130,180)); bY = bY + 30
+local showCloseBtn = mkBtn(bY, 26, Color3.fromRGB(175,35,55),  "HIEN vong X dong",   11); bY = bY + 32
+local p5Lbl    = mkInfoRow(bY, "Fishing: Chua luu", Color3.fromRGB(255,230,80));  bY = bY + 30
+local showCastBtn  = mkBtn(bY, 26, Color3.fromRGB(155,115,0),  "HIEN vong Fishing",  11); bY = bY + 32
 
 mkDiv(bY); bY = bY + 10
 
 -- ----------------------------------------------------------------
--- SECTION: CHECKLIST
+-- CHECKLIST
 -- ----------------------------------------------------------------
 mkSec(bY, "TRANG THAI SETUP"); bY = bY + 20
-
 local checkLabels = {}
 local chkList = {
-    {k = "fish",  l = "Vi tri cau"},
-    {k = "npc",   l = "Vi tri NPC"},
-    {k = "sell",  l = "SellAll"},
-    {k = "close", l = "X dong"},
-    {k = "cast",  l = "Nut Fishing"},
+    {k="fish",  l="Vi tri cau"},
+    {k="npc",   l="Vi tri NPC"},
+    {k="sell",  l="SellAll"},
+    {k="close", l="X dong"},
+    {k="cast",  l="Nut Fishing"},
 }
 for _, c in ipairs(chkList) do
     local f   = mkRow(bY, 26)
     local dot = Instance.new("Frame", f)
-    dot.Size             = UDim2.new(0, 9, 0, 9)
-    dot.Position         = UDim2.new(0, 7, 0.5, -4.5)
-    dot.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
-    dot.BorderSizePixel  = 0; dot.ZIndex = 13
-    Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+    dot.Size=UDim2.new(0,9,0,9); dot.Position=UDim2.new(0,7,0.5,-4.5)
+    dot.BackgroundColor3=Color3.fromRGB(200,60,60); dot.BorderSizePixel=0; dot.ZIndex=13
+    Instance.new("UICorner",dot).CornerRadius=UDim.new(1,0)
     local lbl = Instance.new("TextLabel", f)
-    lbl.Size               = UDim2.new(1, -22, 1, 0)
-    lbl.Position           = UDim2.new(0, 20, 0, 0)
-    lbl.BackgroundTransparency = 1
-    lbl.Text               = c.l
-    lbl.TextColor3         = Color3.fromRGB(200, 60, 60)
-    lbl.Font               = Enum.Font.GothamBold; lbl.TextSize = 10
-    lbl.TextXAlignment     = Enum.TextXAlignment.Left; lbl.ZIndex = 13
-    checkLabels[c.k] = {lbl = lbl, dot = dot}
-    bY = bY + 32
+    lbl.Size=UDim2.new(1,-22,1,0); lbl.Position=UDim2.new(0,20,0,0)
+    lbl.BackgroundTransparency=1; lbl.Text=c.l
+    lbl.TextColor3=Color3.fromRGB(200,60,60)
+    lbl.Font=Enum.Font.GothamBold; lbl.TextSize=10
+    lbl.TextXAlignment=Enum.TextXAlignment.Left; lbl.ZIndex=13
+    checkLabels[c.k]={lbl=lbl,dot=dot}; bY = bY + 32
 end
 
 body.CanvasSize = UDim2.new(0, 0, 0, bY + PAD)
@@ -687,61 +726,50 @@ body.CanvasSize = UDim2.new(0, 0, 0, bY + PAD)
 local function bindMarker(marker, showBtn, onSave)
     showBtn.MouseButton1Click:Connect(function()
         marker.Visible = not marker.Visible
-        showBtn.BackgroundColor3 = marker.Visible
-            and Color3.fromRGB(120, 50, 10)
-            or  showBtn.BackgroundColor3
+        if marker.Visible then
+            showBtn.BackgroundColor3 = Color3.fromRGB(120,50,10)
+        end
     end)
     marker.MouseButton1Click:Connect(function()
         local cx, cy = getCenter(marker)
-        onSave(Vector2.new(cx, cy), cx, cy)
-        marker.BackgroundColor3  = Color3.fromRGB(30, 60, 170)
-        showBtn.BackgroundColor3 = Color3.fromRGB(18, 80, 18)
-        statusText = "Luu (" .. math.floor(cx) .. "," .. math.floor(cy) .. ")"
+        onSave(Vector2.new(cx,cy), cx, cy)
+        marker.BackgroundColor3  = Color3.fromRGB(30,60,170)
+        showBtn.BackgroundColor3 = Color3.fromRGB(18,80,18)
+        statusText = "Luu ("..math.floor(cx)..","..math.floor(cy)..")"
     end)
 end
 
-bindMarker(markerSell, showSellBtn, function(v2, x, y)
-    savedSellPos = v2
-    p3Lbl.Text = "OK (" .. math.floor(x) .. "," .. math.floor(y) .. ")"
-    p3Lbl.TextColor3 = Color3.fromRGB(80, 255, 180)
-    showSellBtn.Text = "âœ” SellAll da luu"
+bindMarker(markerSell, showSellBtn, function(v2,x,y)
+    savedSellPos=v2; p3Lbl.Text="OK ("..math.floor(x)..","..math.floor(y)..")"
+    p3Lbl.TextColor3=Color3.fromRGB(80,255,180); showSellBtn.Text="âœ” SellAll da luu"
 end)
-
-bindMarker(markerClose, showCloseBtn, function(v2, x, y)
-    savedClosePos = v2
-    p4Lbl.Text = "OK (" .. math.floor(x) .. "," .. math.floor(y) .. ")"
-    p4Lbl.TextColor3 = Color3.fromRGB(255, 150, 200)
-    showCloseBtn.Text = "âœ” X dong da luu"
+bindMarker(markerClose, showCloseBtn, function(v2,x,y)
+    savedClosePos=v2; p4Lbl.Text="OK ("..math.floor(x)..","..math.floor(y)..")"
+    p4Lbl.TextColor3=Color3.fromRGB(255,150,200); showCloseBtn.Text="âœ” X dong da luu"
 end)
-
-bindMarker(markerCast, showCastBtn, function(v2, x, y)
-    savedCastPos = v2
-    p5Lbl.Text = "OK (" .. math.floor(x) .. "," .. math.floor(y) .. ")"
-    p5Lbl.TextColor3 = Color3.fromRGB(255, 230, 80)
-    showCastBtn.Text = "âœ” Fishing da luu"
+bindMarker(markerCast, showCastBtn, function(v2,x,y)
+    savedCastPos=v2; p5Lbl.Text="OK ("..math.floor(x)..","..math.floor(y)..")"
+    p5Lbl.TextColor3=Color3.fromRGB(255,230,80); showCastBtn.Text="âœ” Fishing da luu"
 end)
 
 saveFishBtn.MouseButton1Click:Connect(function()
-    local c = LP.Character
-    local r = c and c:FindFirstChild("HumanoidRootPart")
+    local c=LP.Character; local r=c and c:FindFirstChild("HumanoidRootPart")
     if r then
-        savedFishPos = r.Position
-        p1Lbl.Text = "OK " .. math.floor(r.Position.X) .. "," .. math.floor(r.Position.Z)
-        p1Lbl.TextColor3 = Color3.fromRGB(80, 255, 120)
-        saveFishBtn.Text = "âœ” Da luu vi tri cau"
-        saveFishBtn.BackgroundColor3 = Color3.fromRGB(12, 90, 40)
+        savedFishPos=r.Position
+        p1Lbl.Text="OK "..math.floor(r.Position.X)..","..math.floor(r.Position.Z)
+        p1Lbl.TextColor3=Color3.fromRGB(80,255,120)
+        saveFishBtn.Text="âœ” Da luu vi tri cau"
+        saveFishBtn.BackgroundColor3=Color3.fromRGB(12,90,40)
     end
 end)
-
 saveNPCBtn.MouseButton1Click:Connect(function()
-    local c = LP.Character
-    local r = c and c:FindFirstChild("HumanoidRootPart")
+    local c=LP.Character; local r=c and c:FindFirstChild("HumanoidRootPart")
     if r then
-        savedNPCPos = r.Position
-        p2Lbl.Text = "OK " .. math.floor(r.Position.X) .. "," .. math.floor(r.Position.Z)
-        p2Lbl.TextColor3 = Color3.fromRGB(255, 220, 60)
-        saveNPCBtn.Text = "âœ” Da luu vi tri NPC"
-        saveNPCBtn.BackgroundColor3 = Color3.fromRGB(70, 15, 120)
+        savedNPCPos=r.Position
+        p2Lbl.Text="OK "..math.floor(r.Position.X)..","..math.floor(r.Position.Z)
+        p2Lbl.TextColor3=Color3.fromRGB(255,220,60)
+        saveNPCBtn.Text="âœ” Da luu vi tri NPC"
+        saveNPCBtn.BackgroundColor3=Color3.fromRGB(70,15,120)
     end
 end)
 
@@ -749,37 +777,36 @@ end)
 -- BUTTON EVENTS
 -- ================================================================
 local COL_STOP = ColorSequence.new({
-    ColorSequenceKeypoint.new(0, Color3.fromRGB(225, 50,  50)),
-    ColorSequenceKeypoint.new(1, Color3.fromRGB(155, 18,  18)),
+    ColorSequenceKeypoint.new(0,Color3.fromRGB(225,50,50)),
+    ColorSequenceKeypoint.new(1,Color3.fromRGB(155,18,18)),
 })
 local COL_START = ColorSequence.new({
-    ColorSequenceKeypoint.new(0, Color3.fromRGB(50,  220, 85)),
-    ColorSequenceKeypoint.new(1, Color3.fromRGB(18,  145, 48)),
+    ColorSequenceKeypoint.new(0,Color3.fromRGB(50,220,85)),
+    ColorSequenceKeypoint.new(1,Color3.fromRGB(18,145,48)),
 })
 
 toggleBtn.MouseButton1Click:Connect(function()
     isRunning = not isRunning
     if isRunning then
-        sellCount  = 0
-        statusText = "Khoi dong..."
+        sellCount=0; statusText="Khoi dong..."
         task.spawn(mainLoop)
     else
         stopCast(); stopWalk()
-        isSelling = false; statusText = "Da tat"
+        isSelling=false; statusText="Da tat"
     end
 end)
 
 sellNowBtn.MouseButton1Click:Connect(function()
-    if not isRunning then statusText = "Bat tu dong truoc!"; return end
-    countdownSec = 0
-    sellNowBtn.BackgroundColor3 = Color3.fromRGB(255, 60, 0)
-    task.delay(0.6, function() sellNowBtn.BackgroundColor3 = Color3.fromRGB(200, 100, 0) end)
+    if not isRunning then statusText="Bat tu dong truoc!"; return end
+    countdownSec=0
+    sellNowBtn.BackgroundColor3=Color3.fromRGB(255,60,0)
+    task.delay(0.6,function() sellNowBtn.BackgroundColor3=Color3.fromRGB(200,100,0) end)
 end)
 
-UIS.InputBegan:Connect(function(inp, gp)
+UIS.InputBegan:Connect(function(inp,gp)
     if gp then return end
-    if inp.KeyCode == Enum.KeyCode.F then toggleBtn.MouseButton1Click:Fire() end
-    if inp.KeyCode == Enum.KeyCode.H then
+    if inp.KeyCode==Enum.KeyCode.F then toggleBtn.MouseButton1Click:Fire() end
+    if inp.KeyCode==Enum.KeyCode.H then
         if hubOpen then hideHub() else showHub() end
     end
 end)
@@ -787,59 +814,79 @@ end)
 -- ================================================================
 -- UPDATE LOOP
 -- ================================================================
-local _pSt = ""; local _pRun = nil; local _chkPrev = {}
-local chkNames = {fish="Vi tri cau",npc="Vi tri NPC",sell="SellAll",close="X dong",cast="Nut Fishing"}
+local _pSt=""; local _pRun=nil; local _chkPrev={}
+local _wdRestarts = 0   -- dem so lan watchdog da restart
+
+-- patch watchdog de dem va cap nhat UI
+local _origStartCastLoop = startCastLoop
+local wdRestartCount = 0
+
+local chkNames = {
+    fish="Vi tri cau", npc="Vi tri NPC",
+    sell="SellAll", close="X dong", cast="Nut Fishing"
+}
 
 task.spawn(function()
     while true do
         task.wait(0.25)
 
         if statusText ~= _pSt then
-            _pSt = statusText
-            statusLbl.Text = statusText
+            _pSt = statusText; statusLbl.Text = statusText
         end
 
         if isRunning ~= _pRun then
             _pRun = isRunning
             if isRunning then
-                statusLbl.TextColor3      = Color3.fromRGB(80, 255, 140)
-                statusDot.BackgroundColor3 = Color3.fromRGB(60, 255, 80)
-                sDot.BackgroundColor3      = Color3.fromRGB(60, 255, 80)
-                toggleBtn.Text             = "STOP AUTO"
-                tGrad.Color                = COL_STOP
+                statusLbl.TextColor3       = Color3.fromRGB(80,255,140)
+                statusDot.BackgroundColor3  = Color3.fromRGB(60,255,80)
+                sDot.BackgroundColor3       = Color3.fromRGB(60,255,80)
+                toggleBtn.Text              = "STOP AUTO"
+                tGrad.Color                 = COL_STOP
             else
-                statusLbl.TextColor3      = Color3.fromRGB(255, 100, 100)
-                statusDot.BackgroundColor3 = Color3.fromRGB(255, 80, 80)
-                sDot.BackgroundColor3      = Color3.fromRGB(255, 80, 80)
-                toggleBtn.Text             = "START AUTO"
-                tGrad.Color                = COL_START
+                statusLbl.TextColor3       = Color3.fromRGB(255,100,100)
+                statusDot.BackgroundColor3  = Color3.fromRGB(255,80,80)
+                sDot.BackgroundColor3       = Color3.fromRGB(255,80,80)
+                toggleBtn.Text              = "START AUTO"
+                tGrad.Color                 = COL_START
             end
         end
 
         timerLbl.Text = isSelling
-            and ("Dang ban...  Ban: " .. sellCount)
-            or  (math.floor(countdownSec/60) .. ":" .. string.format("%02d", countdownSec%60)
-                 .. "  Ban: " .. sellCount)
+            and ("Dang ban...  Ban: "..sellCount)
+            or  (math.floor(countdownSec/60)..":"..string.format("%02d",countdownSec%60)
+                 .."  Ban: "..sellCount)
+
+        -- Watchdog age
+        local age = tick() - lastCastPing
+        if castActive then
+            if age > 3 then
+                wdLbl.Text = "Watchdog: CANH BAO lag "..string.format("%.0f",age).."s"
+                wdLbl.TextColor3 = Color3.fromRGB(255,100,80)
+            else
+                wdLbl.Text = "Watchdog: ON  ping "..string.format("%.1f",age).."s"
+                wdLbl.TextColor3 = Color3.fromRGB(80,255,160)
+            end
+        else
+            wdLbl.Text = "Watchdog: standby"
+            wdLbl.TextColor3 = Color3.fromRGB(100,200,255)
+        end
 
         local checks = {
-            fish  = savedFishPos  ~= nil,
-            npc   = savedNPCPos   ~= nil,
-            sell  = savedSellPos  ~= nil,
-            close = savedClosePos ~= nil,
-            cast  = savedCastPos  ~= nil,
+            fish=savedFishPos~=nil, npc=savedNPCPos~=nil,
+            sell=savedSellPos~=nil, close=savedClosePos~=nil,
+            cast=savedCastPos~=nil,
         }
-        local green = Color3.fromRGB(80,  255, 120)
-        local red   = Color3.fromRGB(200, 60,  60)
-        for k, v in pairs(checks) do
-            if v ~= _chkPrev[k] and checkLabels[k] then
-                _chkPrev[k] = v
-                local ck = checkLabels[k]
-                ck.lbl.Text             = (v and "âœ” " or "âœ— ") .. chkNames[k]
-                ck.lbl.TextColor3       = v and green or red
-                ck.dot.BackgroundColor3 = v and green or red
+        local green=Color3.fromRGB(80,255,120); local red=Color3.fromRGB(200,60,60)
+        for k,v in pairs(checks) do
+            if v~=_chkPrev[k] and checkLabels[k] then
+                _chkPrev[k]=v
+                local ck=checkLabels[k]
+                ck.lbl.Text=(v and "âœ” " or "âœ— ")..chkNames[k]
+                ck.lbl.TextColor3=v and green or red
+                ck.dot.BackgroundColor3=v and green or red
             end
         end
     end
 end)
 
-print("[TF AutoSell] Ready | F=bat/tat | H=an/hien")
+print("[TF AutoSell] Watchdog ON | F=bat/tat | H=an/hien")

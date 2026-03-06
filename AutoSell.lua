@@ -1,6 +1,6 @@
 -- ================================================================
 -- TITAN FISHING v21  |  Mobile Hub  |  No Teleport
--- NEW: Auto return to fishing spot before casting
+-- NEW: Auto return to fishing spot + Camera lock
 -- ================================================================
 local Players = game:GetService("Players")
 local UIS     = game:GetService("UserInputService")
@@ -24,6 +24,9 @@ local countdownSec   = 0
 local isSelling      = false
 local autoReturn     = false   -- Tá»° Äá»˜NG TRá» Vá»€ CHá»– CÅ¨
 local returnDistance = 3       -- khoang cach toi thieu de kĂ­ch hoat return (studs)
+local camLocked      = false   -- KHOA CAM
+local camLockedCF    = nil     -- CFrame huong nhin da khoa
+local camConnection  = nil     -- RenderStepped connection
 
 local savedFishPos  = nil
 local savedNPCPos   = nil
@@ -41,6 +44,60 @@ local zxcvColors    = {
 }
 
 local INSET = GS:GetGuiInset()
+local camera = workspace.CurrentCamera
+
+-- ================================================================
+-- CAMERA LOCK
+-- Giu nguyen goc xoay camera, van follow nhan vat
+-- ================================================================
+local function lockCamera()
+    if camLocked then return end
+    camLocked = true
+
+    -- Luu goc nhin hien tai (chi lay rotation, khong lay position)
+    -- Ta se tinh lai position moi frame dua tren nhan vat
+    local char = LP.Character
+    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+
+    -- Lay offset tu nhan vat den camera tai thoi diem khoa
+    local camCF = camera.CFrame
+    camLockedCF = camCF  -- luu CFrame goc de lay offset + rotation
+
+    camera.CameraType = Enum.CameraType.Scriptable
+
+    camConnection = RS.RenderStepped:Connect(function()
+        if not camLocked then return end
+        local c   = LP.Character
+        local hrp2 = c and c:FindFirstChild("HumanoidRootPart")
+        if not hrp2 then return end
+
+        -- Tinh offset tu goc xoay da khoa
+        -- Giu nguyen khoang cach va goc, chi doi position theo nhan vat
+        local offset = camLockedCF.Position - (hrp and hrp.Position or hrp2.Position)
+        local newPos = hrp2.Position + offset
+
+        -- Giu nguyen rotation (lookVector) cua camera luc khoa
+        camera.CFrame = CFrame.new(newPos, newPos + camLockedCF.LookVector)
+    end)
+end
+
+local function unlockCamera()
+    if not camLocked then return end
+    camLocked = false
+    if camConnection then camConnection:Disconnect(); camConnection = nil end
+    camera.CameraType = Enum.CameraType.Custom
+    camLockedCF = nil
+end
+
+local function toggleCamLock()
+    if camLocked then
+        unlockCamera()
+        statusText = "Cam: MO KHOA"
+    else
+        lockCamera()
+        statusText = "Cam: DA KHOA"
+    end
+end
 
 -- ================================================================
 -- CLICK
@@ -729,6 +786,31 @@ rtDistPlus.MouseButton1Click:Connect(function()
 end)
 
 mkDiv(pF,fY); fY=fY+8
+mkSec(pF,fY,"KHOA CAM"); fY=fY+20
+
+-- *** TOGGLE CAM LOCK ***
+local camToggleRow, _ = mkToggleRow(pF, fY, "Khoa huong nhin camera", false, function(on)
+    if on then lockCamera() else unlockCamera() end
+    statusText = on and "Cam: DA KHOA" or "Cam: MO KHOA"
+end)
+fY=fY+38
+
+-- Nut khoa ngay (snap khoa cam tai thoi diem bam)
+local camSnapBtn = mkBtn(pF, fY, 26, Color3.fromRGB(40,100,200), "KHOA CAM NGAY", 11)
+fY=fY+32
+
+camSnapBtn.MouseButton1Click:Connect(function()
+    -- Neu dang bat thi tat roi bat lai de cap nhat goc moi
+    if camLocked then unlockCamera() end
+    lockCamera()
+    statusText = "Cam: DA KHOA goc moi"
+    camSnapBtn.BackgroundColor3 = Color3.fromRGB(18,80,18)
+    task.delay(0.8, function()
+        camSnapBtn.BackgroundColor3 = Color3.fromRGB(40,100,200)
+    end)
+end)
+
+mkDiv(pF,fY); fY=fY+8
 mkSec(pF,fY,"SPAM DOC LAP"); fY=fY+20
 
 local castToggleBtn=mkBtn(pF,fY,28,Color3.fromRGB(160,110,0),"NEM CAN: TAT",11); fY=fY+34
@@ -849,9 +931,14 @@ mkSec(pIn,inY,"AUTO RETURN"); inY=inY+20
 local arStatusLbl=mkInfoRow(pIn,inY,"Trang thai: TAT",Color3.fromRGB(140,140,180)); inY=inY+30
 
 mkDiv(pIn,inY); inY=inY+8
+mkSec(pIn,inY,"KHOA CAM"); inY=inY+20
+local camStatusLbl=mkInfoRow(pIn,inY,"Camera: MO KHOA",Color3.fromRGB(140,140,180)); inY=inY+30
+
+mkDiv(pIn,inY); inY=inY+8
 mkSec(pIn,inY,"PHIM TAT"); inY=inY+20
 mkInfoRow(pIn,inY,"F = Bat / Tat auto",Color3.fromRGB(160,160,200)); inY=inY+30
 mkInfoRow(pIn,inY,"H = An / Hien menu",Color3.fromRGB(160,160,200)); inY=inY+30
+mkInfoRow(pIn,inY,"L = Khoa / Mo khoa cam",Color3.fromRGB(160,160,200)); inY=inY+30
 pIn.CanvasSize=UDim2.new(0,0,0,inY+8)
 
 switchTab("fishing")
@@ -973,6 +1060,7 @@ UIS.InputBegan:Connect(function(inp,gp)
     if inp.KeyCode==Enum.KeyCode.H then
         if hubOpen then hideHub() else showHub() end
     end
+    if inp.KeyCode==Enum.KeyCode.L then toggleCamLock() end
 end)
 
 -- ================================================================
@@ -1041,6 +1129,15 @@ task.spawn(function()
             end
         end
 
+        -- Camera lock status
+        if camLocked then
+            camStatusLbl.Text="Camera: DA KHOA đŸ”’"
+            camStatusLbl.TextColor3=Color3.fromRGB(80,200,255)
+        else
+            camStatusLbl.Text="Camera: MO KHOA đŸ”“"
+            camStatusLbl.TextColor3=Color3.fromRGB(140,140,180)
+        end
+
         -- Checklist
         local checks={
             fish=savedFishPos~=nil, npc=savedNPCPos~=nil,
@@ -1061,4 +1158,4 @@ task.spawn(function()
     end
 end)
 
-print("[TF v21] Auto Return | F=bat/tat | H=an/hien")
+print("[TF v21] Auto Return + Cam Lock | F=bat/tat | H=an/hien | L=khoa cam")
